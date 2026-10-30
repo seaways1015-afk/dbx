@@ -1484,26 +1484,52 @@ fn is_oracle_plsql_script_target(database_type: DatabaseType) -> bool {
     matches!(database_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng)
 }
 
+static STORED_PLSQL_UNIT_START: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)^(?:PROCEDURE|FUNCTION|PACKAGE)\b").unwrap());
+static CREATE_PLSQL_UNIT_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(
+        r"(?im)^[ \t]*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?:PACKAGE|PROCEDURE|FUNCTION|TYPE|TRIGGER)\b",
+    )
+    .unwrap()
+});
+static CREATE_PACKAGE_BODY_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?im)^[ \t]*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?PACKAGE\s+BODY\b").unwrap()
+});
+
+/// Split package DDL into the spec and the body it may carry.
+///
+/// Oracle's `DBMS_METADATA.GET_DDL('PACKAGE', ...)` returns the spec followed by
+/// `CREATE OR REPLACE ... PACKAGE BODY`; other sources return the spec alone. An
+/// export writes the body later than the spec, after the routines it may call.
+pub fn split_package_spec_and_body(source: &str) -> (&str, Option<&str>) {
+    let statement_start = leading_sql_statement_start(source);
+    match CREATE_PACKAGE_BODY_LINE.find_iter(source).map(|found| found.start()).find(|&start| start > statement_start) {
+        Some(body_start) => {
+            let spec = strip_standalone_trailing_slash(&source[..body_start]);
+            (spec, Some(source[body_start..].trim()))
+        }
+        None => (source, None),
+    }
+}
+
 /// Stored PL/SQL source starts at `PROCEDURE`/`FUNCTION`/`PACKAGE [BODY]` without
 /// `CREATE OR REPLACE`, and its body contains `;`, so a replayable script needs the
-/// prefix plus a `/` line that ends the unit. Oracle's package DDL carries the spec
-/// and the body as two units, which need a `/` between them as well.
+/// prefix plus a `/` line that ends the unit. A source carrying several units gets a
+/// `/` between them as well.
 fn oracle_plsql_script_unit(source: &str) -> String {
     let source = strip_standalone_trailing_slash(source);
     let statement_start = leading_sql_statement_start(source);
     let (leading, executable) = source.split_at(statement_start);
-    let unit = if Regex::new(r"(?i)^(?:PROCEDURE|FUNCTION|PACKAGE)\b").unwrap().is_match(executable) {
+    let unit = if STORED_PLSQL_UNIT_START.is_match(executable) {
         format!("{leading}CREATE OR REPLACE {executable}")
     } else {
         source.to_string()
     };
-    let unit_start = Regex::new(
-        r"(?im)^[ \t]*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?:PACKAGE|PROCEDURE|FUNCTION|TYPE|TRIGGER)\b",
-    )
-    .unwrap();
     let mut script = String::with_capacity(unit.len() + 8);
     let mut previous = 0;
-    for next in unit_start.find_iter(&unit).map(|found| found.start()).filter(|&start| start > statement_start) {
+    for next in
+        CREATE_PLSQL_UNIT_LINE.find_iter(&unit).map(|found| found.start()).filter(|&start| start > statement_start)
+    {
         let previous_unit = unit[previous..next].trim_end();
         script.push_str(previous_unit);
         script.push_str(if previous_unit.lines().last().map(str::trim) == Some("/") { "\n" } else { "\n/\n" });
@@ -3987,6 +4013,34 @@ mod tests {
 
         for (name, database_type, object_type, source, expected) in cases {
             assert_eq!(build_export_object_source_sql(database_type, object_type, source), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn package_ddl_splits_into_spec_and_body() {
+        let cases = [
+            (
+                "Oracle DDL carrying the body",
+                "CREATE OR REPLACE EDITIONABLE PACKAGE \"HR\".\"P\" AS\n  x NUMBER;\nEND p;\n  CREATE OR REPLACE EDITIONABLE PACKAGE BODY \"HR\".\"P\" AS\nBEGIN NULL; END p;\n",
+                "CREATE OR REPLACE EDITIONABLE PACKAGE \"HR\".\"P\" AS\n  x NUMBER;\nEND p;",
+                Some("CREATE OR REPLACE EDITIONABLE PACKAGE BODY \"HR\".\"P\" AS\nBEGIN NULL; END p;"),
+            ),
+            (
+                "slash between spec and body",
+                "CREATE OR REPLACE PACKAGE p AS\n  x NUMBER;\nEND p;\n/\nCREATE OR REPLACE PACKAGE BODY p AS\nBEGIN NULL; END p;",
+                "CREATE OR REPLACE PACKAGE p AS\n  x NUMBER;\nEND p;",
+                Some("CREATE OR REPLACE PACKAGE BODY p AS\nBEGIN NULL; END p;"),
+            ),
+            (
+                "stored spec alone mentioning the body in a comment",
+                "PACKAGE p AS\n  -- see the PACKAGE BODY for details\n  x NUMBER;\nEND p;",
+                "PACKAGE p AS\n  -- see the PACKAGE BODY for details\n  x NUMBER;\nEND p;",
+                None,
+            ),
+        ];
+
+        for (name, source, spec, body) in cases {
+            assert_eq!(split_package_spec_and_body(source), (spec, body), "{name}");
         }
     }
 

@@ -276,7 +276,7 @@ fn exports_package_objects(request: &DatabaseExportRequest, db_type: DatabaseTyp
         && matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng)
 }
 
-/// Schema-wide objects (routines, triggers, events) are exported as a whole. An explicit
+/// Schema-wide objects (MySQL triggers and events) are exported as a whole. An explicit
 /// table selection must not add unrelated objects to either execution or progress.
 fn exports_schema_wide_objects(request: &DatabaseExportRequest) -> bool {
     request.include_objects && request.selected_tables.is_empty()
@@ -311,15 +311,6 @@ fn exports_oracle_sequence_objects(request: &DatabaseExportRequest, db_type: Dat
 /// orphan sequence to the target schema.
 fn is_oracle_identity_sequence(name: &str) -> bool {
     name.starts_with("ISEQ$$_")
-}
-
-/// Oracle's `DBMS_METADATA.GET_DDL('PACKAGE', ...)` returns the spec followed by
-/// `CREATE OR REPLACE ... PACKAGE BODY`; other engines may return the spec alone.
-fn package_source_includes_body(source: &str) -> bool {
-    static PACKAGE_BODY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?im)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?PACKAGE\s+BODY\b").unwrap()
-    });
-    PACKAGE_BODY.is_match(source)
 }
 
 fn database_export_total_objects(request: &DatabaseExportRequest, counts: &DatabaseExportObjectCounts) -> usize {
@@ -4438,7 +4429,8 @@ async fn export_database_sql_core_inner(
     }
 
     if !request.selected_tables.is_empty() {
-        let selected = |object: &crate::types::ObjectInfo| request.selected_tables.contains(&object.name);
+        let selected_names: HashSet<&str> = request.selected_tables.iter().map(String::as_str).collect();
+        let selected = |object: &crate::types::ObjectInfo| selected_names.contains(object.name.as_str());
         standalone_sequences.retain(selected);
         procedures.retain(selected);
         functions.retain(selected);
@@ -5168,18 +5160,15 @@ async fn export_database_sql_core_inner(
             .chain(procedures.iter().map(|object| (object, ObjectSourceKind::Procedure, "procedure")))
             .chain(functions.iter().map(|object| (object, ObjectSourceKind::Function, "function")))
             .chain(package_bodies.iter().map(|object| (object, ObjectSourceKind::PackageBody, "package body")));
-        // Oracle's package DDL already carries the body, which must not be written twice.
-        let mut packages_exported_with_body: HashSet<String> = HashSet::new();
+        // Oracle's package DDL also carries the body; it is held back for the body's slot
+        // instead of being written with the spec or fetched a second time.
+        let mut deferred_package_bodies: HashMap<String, String> = HashMap::new();
         for (routine, object_type, kind_label) in routine_objects {
             if is_export_cancelled(&request.export_id).await {
                 return Err("Export cancelled".to_string());
             }
 
             let routine_name = &routine.name;
-            if object_type == ObjectSourceKind::PackageBody && packages_exported_with_body.contains(routine_name) {
-                object_index += 1;
-                continue;
-            }
 
             on_progress(ExportProgress {
                 export_id: request.export_id.clone(),
@@ -5195,27 +5184,42 @@ async fn export_database_sql_core_inner(
                 error_summary: None,
             });
 
-            match crate::schema::get_object_source_core(
-                state,
-                &request.connection_id,
-                &request.database,
-                &request.schema,
-                routine_name,
-                object_type.clone(),
-                routine.signature.as_deref(),
-                None,
-            )
-            .await
-            {
-                Ok(obj_source) => {
-                    if object_type == ObjectSourceKind::Package && package_source_includes_body(&obj_source.source) {
-                        packages_exported_with_body.insert(routine_name.clone());
-                    }
+            let deferred_body = if object_type == ObjectSourceKind::PackageBody {
+                deferred_package_bodies.remove(routine_name)
+            } else {
+                None
+            };
+            let routine_source = match deferred_body {
+                Some(body) => Ok(body),
+                None => crate::schema::get_object_source_core(
+                    state,
+                    &request.connection_id,
+                    &request.database,
+                    &request.schema,
+                    routine_name,
+                    object_type.clone(),
+                    routine.signature.as_deref(),
+                    None,
+                )
+                .await
+                .map(|obj_source| obj_source.source),
+            };
+            match routine_source {
+                Ok(routine_source) => {
+                    let routine_source = if object_type == ObjectSourceKind::Package {
+                        let (spec, body) = crate::object_source_sql::split_package_spec_and_body(&routine_source);
+                        if let Some(body) = body {
+                            deferred_package_bodies.insert(routine_name.clone(), body.to_string());
+                        }
+                        spec.to_string()
+                    } else {
+                        routine_source
+                    };
                     let source = build_database_export_object_source_sql(
                         db_type,
                         &object_type,
                         routine_name,
-                        &obj_source.source,
+                        &routine_source,
                         &request.schema,
                         request.drop_table_if_exists,
                     );
@@ -5234,6 +5238,22 @@ async fn export_database_sql_core_inner(
             }
 
             object_index += 1;
+        }
+        // A body that arrived with its spec but has no listed slot of its own is still written.
+        let mut unlisted_package_bodies: Vec<_> = deferred_package_bodies.into_iter().collect();
+        unlisted_package_bodies.sort();
+        for (name, body) in unlisted_package_bodies {
+            let source = build_database_export_object_source_sql(
+                db_type,
+                &ObjectSourceKind::PackageBody,
+                &name,
+                &body,
+                &request.schema,
+                request.drop_table_if_exists,
+            );
+            if !source.is_empty() {
+                writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
+            }
         }
 
         // Export triggers and events after routines: a trigger body may call a routine,
@@ -5851,18 +5871,6 @@ mod tests {
         };
 
         assert_eq!(database_export_total_objects(&export_request(false, false, true, Vec::new()), &counts), 14);
-    }
-
-    #[test]
-    fn oracle_package_ddl_is_recognised_as_carrying_its_body() {
-        use super::package_source_includes_body;
-
-        assert!(package_source_includes_body(
-            "CREATE OR REPLACE EDITIONABLE PACKAGE \"HR\".\"P\" AS\n  x NUMBER;\nEND p;\n  CREATE OR REPLACE EDITIONABLE PACKAGE BODY \"HR\".\"P\" AS\nBEGIN NULL; END p;"
-        ));
-        assert!(!package_source_includes_body(
-            "PACKAGE p AS\n  -- see the PACKAGE BODY for details\n  x NUMBER;\nEND p;"
-        ));
     }
 
     #[test]
