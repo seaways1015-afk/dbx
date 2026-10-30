@@ -1151,6 +1151,17 @@ pub fn build_export_object_source_sql(
     if source.is_empty() {
         return String::new();
     }
+    if is_oracle_plsql_script_target(database_type)
+        && matches!(
+            object_type,
+            ObjectSourceKind::Procedure
+                | ObjectSourceKind::Function
+                | ObjectSourceKind::Package
+                | ObjectSourceKind::PackageBody
+        )
+    {
+        return oracle_plsql_script_unit(source);
+    }
     // MySQL routine bodies, trigger bodies and event bodies may contain `;`, so the
     // exported statements need a client-side delimiter the same way `mysqldump` emits one.
     if is_mysql_like(database_type)
@@ -1467,6 +1478,40 @@ fn executable_oracle_view_ddl(schema: Option<&str>, name: &str, source: &str) ->
     }
 
     format!("CREATE OR REPLACE VIEW {} AS\n{}", postgres_qualified_name(schema, name), ensure_semicolon(trimmed))
+}
+
+fn is_oracle_plsql_script_target(database_type: DatabaseType) -> bool {
+    matches!(database_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng)
+}
+
+/// Stored PL/SQL source starts at `PROCEDURE`/`FUNCTION`/`PACKAGE [BODY]` without
+/// `CREATE OR REPLACE`, and its body contains `;`, so a replayable script needs the
+/// prefix plus a `/` line that ends the unit. Oracle's package DDL carries the spec
+/// and the body as two units, which need a `/` between them as well.
+fn oracle_plsql_script_unit(source: &str) -> String {
+    let source = strip_standalone_trailing_slash(source);
+    let statement_start = leading_sql_statement_start(source);
+    let (leading, executable) = source.split_at(statement_start);
+    let unit = if Regex::new(r"(?i)^(?:PROCEDURE|FUNCTION|PACKAGE)\b").unwrap().is_match(executable) {
+        format!("{leading}CREATE OR REPLACE {executable}")
+    } else {
+        source.to_string()
+    };
+    let unit_start = Regex::new(
+        r"(?im)^[ \t]*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?:PACKAGE|PROCEDURE|FUNCTION|TYPE|TRIGGER)\b",
+    )
+    .unwrap();
+    let mut script = String::with_capacity(unit.len() + 8);
+    let mut previous = 0;
+    for next in unit_start.find_iter(&unit).map(|found| found.start()).filter(|&start| start > statement_start) {
+        let previous_unit = unit[previous..next].trim_end();
+        script.push_str(previous_unit);
+        script.push_str(if previous_unit.lines().last().map(str::trim) == Some("/") { "\n" } else { "\n/\n" });
+        previous = next;
+    }
+    script.push_str(unit[previous..].trim_end());
+    script.push_str("\n/");
+    script
 }
 
 fn executable_oracle_routine_ddl(source: &str) -> String {
@@ -3884,6 +3929,65 @@ mod tests {
         let sql = build_export_object_source_sql(DatabaseType::Mysql, ObjectSourceKind::Procedure, source);
 
         assert_eq!(sql, source);
+    }
+
+    #[test]
+    fn oracle_plsql_export_is_a_replayable_script_unit() {
+        let cases = [
+            (
+                "stored procedure source",
+                DatabaseType::Oracle,
+                ObjectSourceKind::Procedure,
+                "PROCEDURE prc_clear_orders AS\nBEGIN\n  DELETE FROM t_order;\nEND;",
+                "CREATE OR REPLACE PROCEDURE prc_clear_orders AS\nBEGIN\n  DELETE FROM t_order;\nEND;\n/",
+            ),
+            (
+                "function source",
+                DatabaseType::Dameng,
+                ObjectSourceKind::Function,
+                "function fn_total RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;",
+                "CREATE OR REPLACE function fn_total RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;\n/",
+            ),
+            (
+                "package spec",
+                DatabaseType::OceanbaseOracle,
+                ObjectSourceKind::Package,
+                "PACKAGE pkg_order AS\n  PROCEDURE clear_all;\nEND pkg_order;",
+                "CREATE OR REPLACE PACKAGE pkg_order AS\n  PROCEDURE clear_all;\nEND pkg_order;\n/",
+            ),
+            (
+                "package body after a comment",
+                DatabaseType::Oracle,
+                ObjectSourceKind::PackageBody,
+                "-- body\nPACKAGE BODY pkg_order AS\n  PROCEDURE clear_all IS BEGIN NULL; END;\nEND pkg_order;",
+                "-- body\nCREATE OR REPLACE PACKAGE BODY pkg_order AS\n  PROCEDURE clear_all IS BEGIN NULL; END;\nEND pkg_order;\n/",
+            ),
+            (
+                "package DDL carrying the body",
+                DatabaseType::Oracle,
+                ObjectSourceKind::Package,
+                "\n  CREATE OR REPLACE EDITIONABLE PACKAGE \"HR\".\"PKG_ORDER\" AS\n  PROCEDURE clear_all;\nEND pkg_order;\nCREATE OR REPLACE EDITIONABLE PACKAGE BODY \"HR\".\"PKG_ORDER\" AS\n  PROCEDURE clear_all IS BEGIN NULL; END;\nEND pkg_order;",
+                "CREATE OR REPLACE EDITIONABLE PACKAGE \"HR\".\"PKG_ORDER\" AS\n  PROCEDURE clear_all;\nEND pkg_order;\n/\nCREATE OR REPLACE EDITIONABLE PACKAGE BODY \"HR\".\"PKG_ORDER\" AS\n  PROCEDURE clear_all IS BEGIN NULL; END;\nEND pkg_order;\n/",
+            ),
+            (
+                "package DDL already split by a slash",
+                DatabaseType::Oracle,
+                ObjectSourceKind::Package,
+                "CREATE OR REPLACE PACKAGE p AS\n  x NUMBER;\nEND p;\n/\n\nCREATE OR REPLACE PACKAGE BODY p AS\nBEGIN\n  NULL;\nEND p;\n/",
+                "CREATE OR REPLACE PACKAGE p AS\n  x NUMBER;\nEND p;\n/\nCREATE OR REPLACE PACKAGE BODY p AS\nBEGIN\n  NULL;\nEND p;\n/",
+            ),
+            (
+                "full DDL already terminated",
+                DatabaseType::Oracle,
+                ObjectSourceKind::Procedure,
+                "CREATE OR REPLACE EDITIONABLE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/",
+                "CREATE OR REPLACE EDITIONABLE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/",
+            ),
+        ];
+
+        for (name, database_type, object_type, source, expected) in cases {
+            assert_eq!(build_export_object_source_sql(database_type, object_type, source), expected, "{name}");
+        }
     }
 
     #[test]
